@@ -110,13 +110,18 @@ def wait_for_project(cfg, resolve, project_name):
     """
     Attende che un progetto sia caricato in Resolve.
     - Se project_name e' vuoto: aspetta il progetto che si apre da solo
-      (di norma l'ultimo utilizzato).
+      (di norma l'ultimo utilizzato). Appena avviato, Resolve puo' mostrare
+      per qualche secondo un progetto vuoto "Untitled Project" prima che il
+      caricamento del vero ultimo progetto finisca: lo ignoriamo (a meno
+      che sia davvero l'unico disponibile alla scadenza del timeout) e
+      accettiamo un nome solo dopo due controlli di fila con lo stesso
+      risultato, per essere sicuri che si sia stabilizzato.
     - Se project_name e' specificato: prova ad aprirlo esplicitamente e
       aspetta che risulti quello attivo.
     Ritorna il progetto trovato (puo' non coincidere con project_name se
     l'apertura e' fallita: il chiamante verifica il nome).
     """
-    timeout = int(rm.cfg_value(cfg, "silent_render", "project_wait_seconds", default="60"))
+    timeout = int(rm.cfg_value(cfg, "silent_render", "project_wait_seconds", default="180"))
     poll = int(rm.cfg_value(cfg, "silent_render", "poll_interval_seconds", default="3"))
     deadline = time.time() + timeout
 
@@ -131,18 +136,32 @@ def wait_for_project(cfg, resolve, project_name):
             rm.log(f"Errore durante l'apertura del progetto '{project_name}': {e}")
 
     project = None
+    ultimo_nome = None
+    conferme_di_fila = 0
     while time.time() < deadline:
         try:
             project = pm.GetCurrentProject()
         except Exception:
             project = None
+
         if project is not None:
             try:
                 nome_attuale = project.GetName()
             except Exception:
                 nome_attuale = None
-            if not project_name or nome_attuale == project_name:
-                return project
+
+            if project_name:
+                if nome_attuale == project_name:
+                    return project
+            elif nome_attuale and nome_attuale != "Untitled Project":
+                conferme_di_fila = conferme_di_fila + 1 if nome_attuale == ultimo_nome else 1
+                ultimo_nome = nome_attuale
+                if conferme_di_fila >= 2:
+                    return project
+            else:
+                ultimo_nome = nome_attuale
+                conferme_di_fila = 0
+
         time.sleep(poll)
     return project
 
