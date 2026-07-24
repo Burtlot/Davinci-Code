@@ -12,8 +12,12 @@ Cosa fa:
   - Invia una mail QUANDO UN JOB FALLISCE (con percentuale raggiunta e,
     in best-effort, la causa estratta dal log di Resolve).
   - Invia una mail SE UN JOB SI BLOCCA (percentuale ferma troppo a lungo).
+  - Invia una mail SE RESOLVE SI PIANTA/CHIUDE durante un rendering in corso
+    (il collegamento allo scripting va perso prima che il rendering finisca).
   - Invia una mail RIASSUNTIVA A FINE RENDERING con l'esito di OGNI job
     (compresi quelli andati a buon fine, con tempo impiegato).
+  - Ogni volta che invia una mail, stampa a video lo stesso contenuto, cosi'
+    un blocco/crash e' visibile subito anche senza controllare la posta.
 
 Modalita' di avvio:
   python render_monitor.py            -> modalita' "watcher": resta attivo
@@ -104,8 +108,11 @@ def get_resolve():
 # ----------------------------------------------------------------------------
 
 def load_config():
-    """Carica config.ini dalla stessa cartella dello script."""
-    here = os.path.dirname(os.path.abspath(__file__))
+    """Carica config.ini dalla stessa cartella dello script (o dell'eseguibile, se compilato)."""
+    if getattr(sys, "frozen", False):
+        here = os.path.dirname(sys.executable)
+    else:
+        here = os.path.dirname(os.path.abspath(__file__))
     cfg_path = os.path.join(here, "config.ini")
     if not os.path.isfile(cfg_path):
         sys.exit(
@@ -243,6 +250,13 @@ def log(message):
     print(f"[{ts}] {message}", flush=True)
 
 
+def notify(cfg, subject, body):
+    """Invia la mail e stampa a video lo stesso contenuto, cosi' e' visibile
+    subito anche senza controllare la posta (es. in caso di blocco/crash)."""
+    print(body, flush=True)
+    send_email(cfg, subject, body)
+
+
 def job_label(index, info):
     """Etichetta leggibile di un job: numero in coda + nome + JobId."""
     number = index + 1
@@ -289,7 +303,20 @@ def monitor(cfg, run_once=False):
     while True:
         resolve = get_resolve()
         if resolve is None:
-            log("Resolve non raggiungibile (chiuso o scripting non abilitato). Riprovo...")
+            if session_active:
+                # Il collegamento era attivo e un rendering era in corso: se lo
+                # scripting non risponde piu' prima che il rendering sia finito,
+                # e' molto probabile che Resolve si sia piantato/chiuso.
+                log("Collegamento a Resolve PERSO durante un rendering in corso: probabile CRASH.")
+                report = build_crash_report(jobs, last_pct)
+                notify(cfg, "CRASH di DaVinci Resolve durante il rendering", report)
+                session_active = False
+                was_rendering = False
+                if run_once:
+                    log("Modalita' --once: esco dopo l'errore di crash.")
+                    return
+            else:
+                log("Resolve non raggiungibile (chiuso o scripting non abilitato). Riprovo...")
             time.sleep(poll)
             continue
 
@@ -359,7 +386,7 @@ def monitor(cfg, run_once=False):
                         f"{cause}\n"
                     )
                     log(f"FALLITO job #{number} '{name}' al {pct}%")
-                    send_email(cfg, f"ERRORE job #{number} '{name}' ({pct}%)", body)
+                    notify(cfg, f"ERRORE job #{number} '{name}' ({pct}%)", body)
 
                 # BLOCCO (percentuale ferma troppo a lungo mentre e' in rendering)
                 elif jstatus == "Rendering" and job_id not in alerted_stalled:
@@ -381,20 +408,46 @@ def monitor(cfg, run_once=False):
                             f"{cause}\n"
                         )
                         log(f"BLOCCO job #{number} '{name}' fermo al {pct}%")
-                        send_email(cfg, f"BLOCCO job #{number} '{name}' fermo al {pct}%", body)
+                        notify(cfg, f"BLOCCO job #{number} '{name}' fermo al {pct}%", body)
 
         # --- Fine sessione: riepilogo di tutti i job ---
         if not rendering and was_rendering and session_active:
             session_active = False
             summary = build_summary(project, jobs)
             log("Rendering TERMINATO. Invio riepilogo.")
-            send_email(cfg, "Rendering terminato - riepilogo", summary)
+            notify(cfg, "Rendering terminato - riepilogo", summary)
             if run_once:
                 log("Modalita' --once: esco dopo il riepilogo.")
                 return
 
         was_rendering = rendering
         time.sleep(poll)
+
+
+def build_crash_report(jobs, last_pct):
+    """
+    Costruisce il testo del riepilogo quando il collegamento a Resolve viene
+    perso mentre un rendering e' in corso (probabile crash del programma).
+    Usa le ultime percentuali note, perche' il progetto non e' piu' raggiungibile.
+    """
+    righe = []
+    for i, info in enumerate(jobs):
+        number, name, job_id = job_label(i, info)
+        out, target = job_file(info)
+        pct = last_pct.get(job_id, "n/d")
+        righe.append(
+            f"#{number}  {name}\n"
+            f"      File:  {out}\n"
+            f"      Dest:  {target}\n"
+            f"      Ultima percentuale nota: {pct}%\n"
+        )
+
+    intestazione = (
+        "ATTENZIONE: collegamento a DaVinci Resolve PERSO durante il rendering.\n"
+        "Probabile CRASH/chiusura imprevista di DaVinci Resolve.\n"
+        + "=" * 48 + "\n\n"
+    )
+    return intestazione + "\n".join(righe) if righe else intestazione + "(coda vuota)"
 
 
 def build_summary(project, jobs):
